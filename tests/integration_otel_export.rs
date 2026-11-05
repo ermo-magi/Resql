@@ -276,6 +276,17 @@ async fn spans_carry_no_sql_parameters_headers_query_strings_or_events() {
     }
 }
 
+#[tokio::test]
+async fn dependency_spans_are_not_exported() {
+    let (captured, provider, guard) = otel_capture();
+    tracing::info_span!(target: "h2::proto", "dependency_span").in_scope(|| {});
+    tracing::info_span!(target: "resql::server", "own_span").in_scope(|| {});
+    drop(guard);
+    let _ = provider.force_flush();
+    let names: Vec<_> = captured.all().into_iter().map(|s| s.name).collect();
+    assert_eq!(names, vec!["own_span"]);
+}
+
 /// Every env-var-driven check lives in this one test: env is process-global
 /// and the other tests in this binary run in parallel.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

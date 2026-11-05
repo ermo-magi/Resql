@@ -207,9 +207,10 @@ the request span:
 - Request and response bodies.
 - Header values (`Authorization`, cookies, tokens).
 - Query strings.
-- Log events. Only spans are exported; log lines, including driver
-  events that can carry SQL text, stay in the log stream and correlate
-  through `trace_id`.
+- Log events. Only Resql's own spans are exported; log lines, including
+  driver events that can carry SQL text, stay in the log stream and
+  correlate through `trace_id`. Spans from dependencies (HTTP stack,
+  exporter transport) are not exported either.
 
 ## What's not (yet) here
 

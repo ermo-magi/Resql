@@ -8,9 +8,9 @@
 //!   `traceparent` (see `server::request_observability`);
 //! - every saved-query execution becomes a CLIENT span (see
 //!   [`db_span`]);
-//! - only spans are exported. Log events (including driver events that
-//!   can carry SQL text) stay in the log pipeline and correlate through
-//!   the `trace_id` field.
+//! - only Resql's own spans are exported. Log events (including driver
+//!   events that can carry SQL text) stay in the log pipeline and
+//!   correlate through the `trace_id` field; dependency spans are dropped.
 //!
 //! Environment contract (standard OTel variables):
 //!
@@ -164,17 +164,26 @@ pub fn service_name() -> String {
         .unwrap_or_else(|| SERVICE_NAME_DEFAULT.to_string())
 }
 
+/// `true` for metadata Resql itself emits (`resql` or `resql::…` targets).
+fn is_own_target(target: &str) -> bool {
+    target == "resql" || target.starts_with("resql::")
+}
+
 /// The `tracing` layer that exports spans through `provider`.
 ///
-/// Only spans pass; events are filtered out so log lines (and driver
-/// events that may carry SQL text) never become span events.
+/// Only Resql's own spans pass. Events are filtered out so log lines (and
+/// driver events that may carry SQL text) never become span events, and
+/// dependency spans (`hyper`, `h2`, the exporter's own transport at
+/// `debug`/`trace`) are not exported.
 pub fn layer<S>(provider: &TracerProvider) -> impl Layer<S>
 where
     S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
 {
     tracing_opentelemetry::layer()
         .with_tracer(provider.tracer(env!("CARGO_PKG_NAME")))
-        .with_filter(tracing_subscriber::filter::filter_fn(|meta| meta.is_span()))
+        .with_filter(tracing_subscriber::filter::filter_fn(|meta| {
+            meta.is_span() && is_own_target(meta.target())
+        }))
 }
 
 /// Flush pending spans and stop the exporter.
@@ -319,6 +328,14 @@ mod tests {
             Some("UPDATE")
         );
         assert_eq!(leading_sql_keyword("delete from t"), Some("DELETE"));
+    }
+
+    #[test]
+    fn own_target_matches_resql_modules_only() {
+        assert!(is_own_target("resql"));
+        assert!(is_own_target("resql::server"));
+        assert!(!is_own_target("h2::proto::connection"));
+        assert!(!is_own_target("resql_extra"));
     }
 
     #[test]
