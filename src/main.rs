@@ -119,7 +119,7 @@ async fn run_serve(config: Option<&PathBuf>) -> Result<()> {
     let cfg = Config::from_path(&config_path)
         .with_context(|| format!("loading config from {}", config_path.display()))?;
 
-    init_tracing(&cfg.logging.level, &cfg.logging.format);
+    let tracer_provider = init_tracing(&cfg.logging.level, &cfg.logging.format);
 
     // Boot-time diagnostic pass (REFACTO-REQUIREMENTS §6.2): every Java-shape
     // field the compat shim recognised is announced here so the operator can
@@ -188,6 +188,8 @@ async fn run_serve(config: Option<&PathBuf>) -> Result<()> {
     // sessions).
     state.registry.close_all().await;
     info!("bye");
+    // Flush spans still queued in the batch exporter (no-op when export is off).
+    resql::observability::shutdown(tracer_provider);
     Ok(())
 }
 
@@ -259,7 +261,10 @@ fn doctor(config: Option<&PathBuf>, strict: bool) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn init_tracing(level: &str, format: &str) {
+/// Install the global subscriber. Returns the OTLP tracer provider when
+/// `OTEL_EXPORTER_OTLP_ENDPOINT` enables trace export (see
+/// `resql::observability`); the caller shuts it down on exit.
+fn init_tracing(level: &str, format: &str) -> Option<opentelemetry_sdk::trace::TracerProvider> {
     // RESQL_LOG env overrides YAML level; RESQL_LOG_FORMAT overrides
     // YAML format so an operator can flip a running container's log
     // shape (text ↔ json) without editing the config file.
@@ -274,6 +279,8 @@ fn init_tracing(level: &str, format: &str) {
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
 
+    // `None` when export is off; an absent layer leaves the stack as before.
+    let provider = resql::observability::init_provider_from_env();
     let base = tracing_subscriber::registry().with(filter);
     match effective_format.as_str() {
         "json" => base
@@ -283,10 +290,16 @@ fn init_tracing(level: &str, format: &str) {
                     .with_current_span(true)
                     .with_span_list(false),
             )
+            .with(provider.as_ref().map(resql::observability::layer))
             .try_init()
             .ok(),
-        _ => base.with(tracing_subscriber::fmt::layer()).try_init().ok(),
+        _ => base
+            .with(tracing_subscriber::fmt::layer())
+            .with(provider.as_ref().map(resql::observability::layer))
+            .try_init()
+            .ok(),
     };
+    provider
 }
 
 /// Container-native health check. Point `HEALTHCHECK CMD ["/app/resql",

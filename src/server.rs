@@ -507,17 +507,56 @@ async fn request_observability(cfg: LoggingConfig, mut req: Request, next: Next)
         .unwrap_or("")
         .to_string();
 
-    // Adopt or generate traceparent; inject back so any future
-    // header-reading code sees the resolved value.
-    let (traceparent_value, needed_injection) = match req
+    let inbound_traceparent = req
         .headers()
         .get(TRACEPARENT_HEADER)
         .and_then(|v| v.to_str().ok())
-    {
-        Some(existing) => (existing.to_string(), false),
-        None => (generate_traceparent(), true),
+        .map(str::to_string);
+    let is_health = uri_path == HEALTH_PATH || uri_path == HEALTHZ_PATH;
+    let otel_active = crate::observability::otel_active();
+    let route_for_log = truncate_for_log(&sanitize_log_value(&uri_path), 512);
+    // The `otel.*`, status and `error.type` fields stay empty unless OTLP
+    // export is on, so log output is unchanged when it is off. `trace_id`
+    // is recorded right after creation (before any event), once resolved.
+    // With export on, health probes get no span: they would dominate the
+    // exported data.
+    let request_span = if otel_active && is_health {
+        tracing::Span::none()
+    } else {
+        tracing::info_span!(
+            "http_request",
+            otel.name = tracing::field::Empty,
+            otel.kind = tracing::field::Empty,
+            otel.status_code = tracing::field::Empty,
+            http.request.method = %method_str,
+            http.route = %route_for_log,
+            http.response.status_code = tracing::field::Empty,
+            "error.type" = tracing::field::Empty,
+            resql.project = %project_str,
+            trace_id = tracing::field::Empty,
+        )
     };
-    if needed_injection {
+    // Adopt the inbound traceparent verbatim, or generate one. With OTLP
+    // export on, the request span is parented on the inbound context and
+    // the propagated value is the span's own context (same trace id, this
+    // span as parent), so exported spans, logs and `X-Trace-Id` share one
+    // trace. Injected back into the request so any header-reading code
+    // downstream sees the resolved value.
+    let traceparent_value = if otel_active {
+        request_span.record("otel.name", format!("{method_str} {route_for_log}"));
+        request_span.record("otel.kind", "server");
+        if let Some(tp) = inbound_traceparent.as_deref() {
+            crate::observability::set_parent_from_traceparent(&request_span, tp);
+        }
+        crate::observability::traceparent_of(&request_span)
+            .or_else(|| inbound_traceparent.clone())
+            .unwrap_or_else(generate_traceparent)
+    } else {
+        inbound_traceparent
+            .clone()
+            .unwrap_or_else(generate_traceparent)
+    };
+    if inbound_traceparent.as_deref() != Some(traceparent_value.as_str()) {
         if let Ok(hv) = HeaderValue::try_from(traceparent_value.as_str()) {
             req.headers_mut()
                 .insert(HeaderName::from_static(TRACEPARENT_HEADER), hv);
@@ -527,16 +566,20 @@ async fn request_observability(cfg: LoggingConfig, mut req: Request, next: Next)
         .unwrap_or("")
         .to_string();
 
-    let request_span = tracing::info_span!(
-        "http_request",
-        http.request.method = %method_str,
-        http.route = %truncate_for_log(&sanitize_log_value(&uri_path), 512),
-        resql.project = %project_str,
-        trace_id = %trace_id_str,
-    );
+    // Display (not Debug) so the text formatter renders it unquoted, as before.
+    request_span.record("trace_id", tracing::field::display(&trace_id_str));
     let span_for_log = request_span.clone();
 
     let mut response = next.run(req).instrument(request_span).await;
+    if otel_active {
+        let status = response.status().as_u16();
+        span_for_log.record("http.response.status_code", status);
+        // 4xx is not a server-side error (OTel HTTP conventions).
+        if status >= 500 {
+            span_for_log.record("otel.status_code", "ERROR");
+            span_for_log.record("error.type", status.to_string());
+        }
+    }
 
     // Echo trace id back to caller so they can correlate their logs.
     if !trace_id_str.is_empty() {
@@ -559,7 +602,6 @@ async fn request_observability(cfg: LoggingConfig, mut req: Request, next: Next)
     }
 
     // Skip access log for health probes — they'd drown real traffic.
-    let is_health = uri_path == HEALTH_PATH || uri_path == HEALTHZ_PATH;
     if cfg.access_log && !is_health {
         let status = response.status().as_u16();
         let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -819,11 +861,22 @@ async fn dispatch(
         .registry
         .get(&ds_name)
         .ok_or_else(|| ResqlError::UnknownDataSource(ds_name.clone()))?;
-    let rows = if saved.transactional {
-        query::execute_transactional(pool, &saved.sql, &saved.declaration, &body).await?
+    // CLIENT span for the execution when OTLP export is on (`Span::none()`
+    // otherwise). Not entered, so log events keep the request span.
+    let db_span =
+        crate::observability::db_span(pool, &ds_name, &format!("{project_key}/{tail}"), &saved.sql);
+    let result = if saved.transactional {
+        query::execute_transactional(pool, &saved.sql, &saved.declaration, &body).await
     } else {
-        query::execute(pool, &saved.sql, &saved.declaration, &body).await?
+        query::execute(pool, &saved.sql, &saved.declaration, &body).await
     };
+    crate::observability::record_db_outcome(
+        &db_span,
+        result.as_ref().ok().map(Vec::len),
+        result.as_ref().err().map(ResqlError::kind),
+    );
+    drop(db_span);
+    let rows = result?;
     Ok(Json(json!(rows)))
 }
 
@@ -860,7 +913,20 @@ async fn dispatch_batch(
         ResqlError::MalformedRequest(format!("batch body must be {{queries: [...]}}: {e}"))
     })?;
 
-    let results = query::execute_batch(pool, &saved.sql, &saved.declaration, batch.queries).await?;
+    let db_span =
+        crate::observability::db_span(pool, &ds_name, &format!("{project_key}/{tail}"), &saved.sql);
+    db_span.record("db.operation.batch.size", batch.queries.len() as u64);
+    let result = query::execute_batch(pool, &saved.sql, &saved.declaration, batch.queries).await;
+    crate::observability::record_db_outcome(
+        &db_span,
+        result
+            .as_ref()
+            .ok()
+            .map(|sets| sets.iter().map(Vec::len).sum()),
+        result.as_ref().err().map(ResqlError::kind),
+    );
+    drop(db_span);
+    let results = result?;
     let all: Vec<Value> = results.into_iter().map(|rows| json!(rows)).collect();
     Ok(Json(Value::Array(all)))
 }

@@ -143,11 +143,79 @@ otel-instrumented client SDK), Resql adopts it verbatim — no
 first sight and echoes it in `X-Trace-Id`; wire it into your client's
 logs and end-to-end correlation just works.
 
+## Trace export (OTLP)
+
+Off by default. Setting `OTEL_EXPORTER_OTLP_ENDPOINT` makes Resql export
+spans to any OpenTelemetry collector or OTLP-compatible backend. With the
+variable unset, nothing changes: no spans are exported and log output is
+identical to a build without this feature.
+
+| Variable | Effect |
+|---|---|
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | Enables export. gRPC: `http://collector:4317`. HTTP: `http(s)://collector:4318` (Resql appends `/v1/traces`). |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` / `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL` | `grpc` (default) or `http/protobuf`. The per-signal variable wins; other values fall back to `grpc` with a warning. |
+| `OTEL_EXPORTER_OTLP_HEADERS` | Exporter headers, e.g. `authorization=Bearer%20<token>`. Values are never logged. |
+| `OTEL_EXPORTER_OTLP_TIMEOUT` | Export timeout in milliseconds. |
+| `OTEL_SERVICE_NAME` | `service.name` resource attribute. Default `resql`. |
+| `OTEL_RESOURCE_ATTRIBUTES` | Extra resource attributes, e.g. `deployment.environment=staging`. `service.name` and `service.version` from Resql win. |
+
+TLS: use `http/protobuf` with an `https://` endpoint (rustls with the
+bundled Mozilla root set; a private CA is not trusted). The gRPC exporter
+is plaintext; an `https://`
+endpoint with `grpc` logs a boot warning and exports will fail. For a TLS
+backend over gRPC, run a collector next to Resql and let it forward.
+
+If the collector is down, requests are unaffected; spans are dropped
+from the bounded export queue.
+
+### Spans
+
+**Request span** (kind `SERVER`), one per request:
+
+- name `"{METHOD} {path}"`, e.g. `GET /users/hello`;
+- `http.request.method`, `http.route`, `http.response.status_code`,
+  `resql.project`;
+- parented on the inbound W3C `traceparent` when present, so the span
+  joins the caller's trace;
+- status `ERROR` and `error.type` = status code for 5xx only (4xx is a
+  client error, not a server failure).
+
+With export on, the `traceparent` returned to the caller (and seen by
+anything downstream) carries Resql's own span id under the same trace
+id. `X-Trace-Id` and the `trace_id` log field are unchanged.
+
+`/health` and `/healthz` produce no spans: probes would dominate the
+exported data.
+
+**Query span** (kind `CLIENT`), one per saved-query execution, child of
+the request span:
+
+| Attribute | Value |
+|---|---|
+| name | `"{db.operation.name} {project}/{query}"`, e.g. `SELECT users/hello`; just `{project}/{query}` when the operation is not known |
+| `db.system`, `db.system.name` | `postgresql`, `sqlite` or `mysql` (MariaDB reports `mysql`) |
+| `db.namespace` | datasource name |
+| `db.operation.name` | leading keyword (`SELECT`, `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `CALL`); omitted otherwise, e.g. for `WITH …` |
+| `resql.query` | `<project>/<saved-query>` |
+| `resql.rows` | rows returned (batch: total over all parameter sets) |
+| `db.operation.batch.size` | number of parameter sets, batch endpoints only |
+| `error.type` | the `X-Resql-Error-Code` value; span status `ERROR` |
+
+### Never exported
+
+- SQL text and bind parameter values.
+- Request and response bodies.
+- Header values (`Authorization`, cookies, tokens).
+- Query strings.
+- Log events. Only spans are exported; log lines, including driver
+  events that can carry SQL text, stay in the log stream and correlate
+  through `trace_id`.
+
 ## What's not (yet) here
 
-- **OTLP span export.** Resql does not currently push spans to an
-  OpenTelemetry collector. When it lands, the request span already
-  carries the right fields — no code changes at the call sites.
+- **Connection-pool wait in spans.** The query span covers pool
+  acquire + execution together; there is no separate pool-wait span or
+  attribute yet.
 - **Access-log body inclusion.** Ruuter-on-Rust has toggles for
   `display_request_content` / `display_response_content` on step
   execution; Resql's request path is simpler (no DSL / no steps) so

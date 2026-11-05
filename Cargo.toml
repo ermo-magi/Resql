@@ -34,6 +34,14 @@ tower = { version = "0.5", default-features = false, features = ["util"] }
 tower-http = { version = "0.6", default-features = false, features = ["cors", "limit", "timeout"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "json"] }
+# Optional OTLP trace export, enabled at runtime by OTEL_EXPORTER_OTLP_ENDPOINT.
+# tonic is built without TLS (keeps rustls-pemfile out of the tree); TLS
+# endpoints use OTLP/HTTP through reqwest + rustls.
+opentelemetry = { version = "0.27", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.27", default-features = false, features = ["trace", "rt-tokio"] }
+opentelemetry-otlp = { version = "0.27", default-features = false, features = ["trace", "grpc-tonic", "http-proto", "reqwest-client"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+tracing-opentelemetry = { version = "0.28", default-features = false }
 
 [dev-dependencies]
 axum = { version = "0.7", default-features = false, features = ["http1", "json", "matched-path", "tokio", "query"] }

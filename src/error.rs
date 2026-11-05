@@ -114,7 +114,8 @@ pub enum ResqlError {
 }
 
 impl ResqlError {
-    fn kind(&self) -> &'static str {
+    /// The `X-Resql-Error-Code` value for this error.
+    pub(crate) fn kind(&self) -> &'static str {
         match self {
             ResqlError::QueryNotFound(_) => "ResqlRuntimeException",
             ResqlError::UnknownDataSource(_) => "UnknownDataSourceNameException",
