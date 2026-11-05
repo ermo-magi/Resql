@@ -220,6 +220,38 @@ pub fn traceparent_of(span: &tracing::Span) -> Option<String> {
     ))
 }
 
+/// The OTel span id of `span` (16 hex), or `None` when no OTel layer
+/// recorded it.
+pub fn span_id_of(span: &tracing::Span) -> Option<String> {
+    let cx = span.context();
+    let sc = cx.span().span_context().clone();
+    sc.is_valid().then(|| sc.span_id().to_string())
+}
+
+tokio::task_local! {
+    static RESOLVED_ROUTE: std::cell::RefCell<Option<String>>;
+}
+
+/// Run `f` with a slot that [`set_resolved_route`] can fill, and return the
+/// route recorded while it ran. Used by the request middleware so the
+/// request span is named after the saved query instead of the raw path.
+pub async fn with_route_slot<F: std::future::Future>(f: F) -> (F::Output, Option<String>) {
+    RESOLVED_ROUTE
+        .scope(std::cell::RefCell::new(None), async {
+            let out = f.await;
+            let route = RESOLVED_ROUTE.with(|r| r.borrow_mut().take());
+            (out, route)
+        })
+        .await
+}
+
+/// Record the route template of the current request (e.g. the saved-query
+/// path `/<project>/<query>`). No-op outside [`with_route_slot`], i.e. when
+/// export is off.
+pub fn set_resolved_route(route: String) {
+    let _ = RESOLVED_ROUTE.try_with(|r| *r.borrow_mut() = Some(route));
+}
+
 /// `db.system` value for a pool. MariaDB shares the `mysql` value because
 /// the pool does not distinguish the two.
 pub fn db_system(pool: &Pool) -> &'static str {

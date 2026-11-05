@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use axum::extract::{Path, Query, Request, State};
+use axum::extract::{MatchedPath, Path, Query, Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -515,25 +515,43 @@ async fn request_observability(cfg: LoggingConfig, mut req: Request, next: Next)
     let is_health = uri_path == HEALTH_PATH || uri_path == HEALTHZ_PATH;
     let otel_active = crate::observability::otel_active();
     let route_for_log = truncate_for_log(&sanitize_log_value(&uri_path), 512);
-    // The `otel.*`, status and `error.type` fields stay empty unless OTLP
-    // export is on, so log output is unchanged when it is off. `trace_id`
-    // is recorded right after creation (before any event), once resolved.
-    // With export on, health probes get no span: they would dominate the
+    // Export off: the span carries exactly the fields it always had, so log
+    // output is unchanged. `trace_id` is recorded right after creation
+    // (before any event), once resolved.
+    //
+    // Export on: a SERVER span whose `http.route` is a template, never the
+    // raw path: the saved-query path once `dispatch` has resolved it (see
+    // `observability::set_resolved_route`), else the matched axum route or
+    // `unmatched`. Health probes get no span: they would dominate the
     // exported data.
-    let request_span = if otel_active && is_health {
+    let matched_route = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|m| m.as_str().to_string())
+        .unwrap_or_else(|| "unmatched".to_string());
+    let request_span = if !otel_active {
+        tracing::info_span!(
+            "http_request",
+            http.request.method = %method_str,
+            http.route = %route_for_log,
+            resql.project = %project_str,
+            trace_id = tracing::field::Empty,
+        )
+    } else if is_health {
         tracing::Span::none()
     } else {
         tracing::info_span!(
             "http_request",
-            otel.name = tracing::field::Empty,
-            otel.kind = tracing::field::Empty,
+            otel.name = %format!("{method_str} {matched_route}"),
+            otel.kind = "server",
             otel.status_code = tracing::field::Empty,
             http.request.method = %method_str,
-            http.route = %route_for_log,
+            http.route = tracing::field::Empty,
             http.response.status_code = tracing::field::Empty,
             "error.type" = tracing::field::Empty,
-            resql.project = %project_str,
+            resql.project = tracing::field::Empty,
             trace_id = tracing::field::Empty,
+            span_id = tracing::field::Empty,
         )
     };
     // Adopt the inbound traceparent verbatim, or generate one. With OTLP
@@ -543,8 +561,6 @@ async fn request_observability(cfg: LoggingConfig, mut req: Request, next: Next)
     // trace. Injected back into the request so any header-reading code
     // downstream sees the resolved value.
     let traceparent_value = if otel_active {
-        request_span.record("otel.name", format!("{method_str} {route_for_log}"));
-        request_span.record("otel.kind", "server");
         if let Some(tp) = inbound_traceparent.as_deref() {
             crate::observability::set_parent_from_traceparent(&request_span, tp);
         }
@@ -568,10 +584,30 @@ async fn request_observability(cfg: LoggingConfig, mut req: Request, next: Next)
 
     // Display (not Debug) so the text formatter renders it unquoted, as before.
     request_span.record("trace_id", tracing::field::display(&trace_id_str));
+    // Export on: JSON log lines inside the request carry the OTel span id
+    // next to `trace_id`.
+    if let Some(span_id) = crate::observability::span_id_of(&request_span) {
+        request_span.record("span_id", tracing::field::display(&span_id));
+    }
     let span_for_log = request_span.clone();
 
-    let mut response = next.run(req).instrument(request_span).await;
+    let (mut response, resolved_route) = if otel_active {
+        crate::observability::with_route_slot(next.run(req).instrument(request_span)).await
+    } else {
+        (next.run(req).instrument(request_span).await, None)
+    };
     if otel_active {
+        // `resql.project` only for a resolved saved query, so unknown paths
+        // add no free-form attribute values.
+        if let Some(project) = resolved_route
+            .as_deref()
+            .and_then(|r| r.split('/').find(|s| !s.is_empty()))
+        {
+            span_for_log.record("resql.project", project);
+        }
+        let route = resolved_route.unwrap_or(matched_route);
+        span_for_log.record("http.route", route.as_str());
+        span_for_log.record("otel.name", format!("{method_str} {route}"));
         let status = response.status().as_u16();
         span_for_log.record("http.response.status_code", status);
         // 4xx is not a server-side error (OTel HTTP conventions).
@@ -856,6 +892,9 @@ async fn dispatch(
             ))));
         }
     };
+    // Export on: the request span's `http.route` becomes the saved-query
+    // path (bounded by the SQL tree). No-op when export is off.
+    crate::observability::set_resolved_route(format!("/{project_key}/{tail}"));
     let ds_name = choose_datasource(&state.config, &project_key, &headers)?;
     let pool = state
         .registry
@@ -894,6 +933,7 @@ async fn dispatch_batch(
         .ok_or_else(|| {
             ResqlError::QueryNotFound(truncate_user_input(&format!("/{project}/{tail}")))
         })?;
+    crate::observability::set_resolved_route(format!("/{project_key}/{tail}/batch"));
     let ds_name = choose_datasource(&state.config, &project_key, &headers)?;
     let pool = state
         .registry

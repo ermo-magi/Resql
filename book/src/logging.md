@@ -172,9 +172,12 @@ from the bounded export queue.
 
 **Request span** (kind `SERVER`), one per request:
 
-- name `"{METHOD} {path}"`, e.g. `GET /users/hello`;
-- `http.request.method`, `http.route`, `http.response.status_code`,
-  `resql.project`;
+- name `"{METHOD} {http.route}"`, e.g. `GET /users/hello`;
+- `http.route` is a template, never the raw request path: the saved-query
+  path (`/<project>/<query>`, `/<project>/<query>/batch`) when the query
+  exists, otherwise the matched route (`/:project/*tail`) or `unmatched`;
+- `http.request.method`, `http.response.status_code`, and
+  `resql.project` for a resolved saved query;
 - parented on the inbound W3C `traceparent` when present, so the span
   joins the caller's trace;
 - status `ERROR` and `error.type` = status code for 5xx only (4xx is a
@@ -182,7 +185,8 @@ from the bounded export queue.
 
 With export on, the `traceparent` returned to the caller (and seen by
 anything downstream) carries Resql's own span id under the same trace
-id. `X-Trace-Id` and the `trace_id` log field are unchanged.
+id. `X-Trace-Id` and the `trace_id` log field are unchanged; log lines
+inside the request additionally carry the span's `span_id`.
 
 `/health` and `/healthz` produce no spans: probes would dominate the
 exported data.

@@ -108,6 +108,8 @@ async fn request_and_query_spans_continue_inbound_trace() {
         Some("200")
     );
     assert_eq!(server.status, Status::Unset);
+    // R8: the span id recorded for JSON logs is the exported span's own.
+    assert_eq!(attr(server, "span_id"), Some(ctx.span_id().to_string()));
     // Same trace id on the response; the propagated span id is Resql's own
     // request span so callers' and callees' spans nest correctly.
     assert_eq!(
@@ -224,6 +226,49 @@ async fn batch_query_span_records_batch_size_and_total_rows() {
     assert_eq!(db.name, "SELECT demo/lookup");
     assert_eq!(attr(db, "db.operation.batch.size").as_deref(), Some("3"));
     assert_eq!(attr(db, "resql.rows").as_deref(), Some("2"));
+}
+
+#[tokio::test]
+async fn request_span_route_is_a_template_never_the_raw_path() {
+    let app = TestAppBuilder::new()
+        .with_sql("demo/GET/ping.sql", PING_SQL)
+        .with_sql("demo/POST/add.sql", "SELECT :v AS v")
+        .build()
+        .await;
+    let (captured, provider, guard) = otel_capture();
+    let (s1, _) = app.request("GET", "/demo/RAW-PATH-1", None, &[]).await;
+    let (s2, _) = app.request("GET", "/RAW-PATH-2", None, &[]).await;
+    let (s3, _) = app
+        .request(
+            "POST",
+            "/demo/add/batch",
+            Some(r#"{"queries":[{"v":"a"}]}"#),
+            &[],
+        )
+        .await;
+    drop(guard);
+    let _ = provider.force_flush();
+    assert_eq!((s1, s2, s3), (400, 404, 200));
+
+    let servers = captured.of_kind(SpanKind::Server);
+    let names: Vec<_> = servers.iter().map(|s| s.name.to_string()).collect();
+    assert_eq!(
+        names,
+        vec![
+            "GET /:project/*tail",
+            "GET unmatched",
+            "POST /demo/add/batch"
+        ]
+    );
+    for span in &servers {
+        let dump = format!("{} {:?}", span.name, span.attributes);
+        assert!(!dump.contains("RAW-PATH"), "raw path leaked: {dump}");
+    }
+    assert_eq!(attr(&servers[2], "resql.project").as_deref(), Some("demo"));
+    assert_eq!(
+        attr(&servers[2], "http.route").as_deref(),
+        Some("/demo/add/batch")
+    );
 }
 
 #[tokio::test]
