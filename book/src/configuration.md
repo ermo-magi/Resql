@@ -161,6 +161,10 @@ to a single-key cache.
 The `RESQL_LOG` env var overrides `level` at runtime; `RESQL_LOG_FORMAT`
 overrides `format`. Neither touches the config file.
 
+OTLP trace export is configured with the standard `OTEL_*` environment
+variables, not this file; see [Trace export (OTLP)](./logging.md#trace-export-otlp).
+It is independent of `level`.
+
 ## `openapi`
 
 | Field | Type | Default | Purpose |
@@ -216,8 +220,13 @@ $ echo $?
   runtime-posture refuse).
 - Exit `2` — warnings only, with `--strict`.
 
-Never binds a port, never opens a datasource pool. Safe to run
-against a production config file.
+When `OTEL_EXPORTER_OTLP_ENDPOINT` is set in the environment, doctor also
+prints an `INFO: [otel]` line describing the export and one `WARN: [otel]`
+line per problem (see [Trace export](./logging.md#trace-export-otlp)); those
+count towards `--strict`.
+
+Never binds a port, never opens a datasource pool, never contacts a
+collector. Safe to run against a production config file.
 
 ## Env-var overrides
 

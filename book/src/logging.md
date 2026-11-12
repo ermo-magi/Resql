@@ -152,21 +152,46 @@ identical to a build without this feature.
 
 | Variable | Effect |
 |---|---|
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | Enables export. gRPC: `http://collector:4317`. HTTP: `http(s)://collector:4318` (Resql appends `/v1/traces`). |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | Enables export. gRPC: `http://collector:4317`. HTTP: `http(s)://collector:4318` (Resql appends `/v1/traces`). Must not carry credentials (`user:pass@`, `?query`, `#fragment`): such an endpoint is refused and export stays off, see below. |
 | `OTEL_EXPORTER_OTLP_PROTOCOL` / `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL` | `grpc` (default) or `http/protobuf`. The per-signal variable wins; other values fall back to `grpc` with a warning. |
 | `OTEL_EXPORTER_OTLP_HEADERS` | Exporter headers, e.g. `authorization=Bearer%20<token>`. Values are never logged. |
-| `OTEL_EXPORTER_OTLP_TIMEOUT` | Export timeout in milliseconds. |
+| `OTEL_EXPORTER_OTLP_TIMEOUT` / `OTEL_EXPORTER_OTLP_TRACES_TIMEOUT` | Timeout of each export request in milliseconds, both transports. Default `10000`. The per-signal variable wins; a value that is not a positive integer falls back to the default with a warning. |
+| `OTEL_TRACES_SAMPLER` / `OTEL_TRACES_SAMPLER_ARG` | Standard OTel sampling, e.g. `parentbased_traceidratio` with `0.1`. Default `parentbased_always_on`. |
 | `OTEL_SERVICE_NAME` | `service.name` resource attribute. Default `resql`. |
 | `OTEL_RESOURCE_ATTRIBUTES` | Extra resource attributes, e.g. `deployment.environment=staging`. `service.name` and `service.version` from Resql win. |
 
 TLS: use `http/protobuf` with an `https://` endpoint (rustls with the
 bundled Mozilla root set; a private CA is not trusted). The gRPC exporter
-is plaintext; an `https://`
-endpoint with `grpc` logs a boot warning and exports will fail. For a TLS
-backend over gRPC, run a collector next to Resql and let it forward.
+is plaintext; an `https://` endpoint with `grpc` logs a boot warning and
+exports will fail. For a TLS backend over gRPC, run a collector next to
+Resql and let it forward.
 
-If the collector is down, requests are unaffected; spans are dropped
-from the bounded export queue.
+Secrets go in `OTEL_EXPORTER_OTLP_HEADERS`, never in the endpoint:
+exporter errors repeat the endpoint URL, so an endpoint carrying
+credentials is refused at boot (`OTLP trace export disabled`) and the
+service runs on without export.
+
+### Operating it
+
+- **Independent of the log level.** `RESQL_LOG` / `logging.level` decide
+  what is logged, not what is exported: at `warn` or `error` the access
+  log disappears and spans are still exported.
+- **Boot output.** With export on, one `INFO` line announces it
+  (`OTLP trace export enabled`, with scheme, host and port only, never
+  credentials or the path), plus one `WARN` per problem: an `https://`
+  endpoint with gRPC, `OTEL_EXPORTER_OTLP_HEADERS` sent in plaintext to a
+  non-loopback `http://` collector, or an unusable protocol or timeout
+  value. `resql doctor` prints the same lines (`[otel]`) without
+  contacting anything, and `--strict` exits 2 on them.
+- **Collector problems.** Requests are never affected: spans are dropped
+  from the bounded export queue. Failed exports are logged at `ERROR` by
+  the `opentelemetry_sdk` target (for example `BatchSpanProcessor.…ExportError`
+  with `Status(401…)` or `ConnectionRefused`), at most one line per batch
+  while traffic flows. Header values never appear.
+- **Shutdown.** On SIGTERM the queued spans are flushed, for at most 5
+  seconds; if the collector is hung the abandoned flush is logged
+  (`did not finish before the shutdown deadline`) and the process exits,
+  inside the 10 s `docker stop` grace period.
 
 ### Spans
 

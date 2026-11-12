@@ -462,3 +462,28 @@ against the MySQL / MariaDB wire protocol.
   `sqlx` features and removing `Pool::MySql` + `Dialect::MySql`
   reverts the surface); every `.sql` file written for MySQL stays
   MySQL — reversal is "lose the backend," not "rewrite SQL."
+
+## DIV-024 — Optional OTLP trace export; `traceparent` carries Resql's span id
+
+- **Field / behaviour.** Span export over OTLP, and the value of the
+  `traceparent` response header when it is on.
+- **Source of truth.** Java Resql ships OpenTelemetry dependencies but
+  instruments nothing and exports nothing (backlog task 004 records
+  the finding); it echoes no `traceparent`.
+- **Target behaviour.** Export is off unless `OTEL_EXPORTER_OTLP_ENDPOINT`
+  is set (`src/observability.rs`). With it unset nothing changes: spans are
+  not created, log output is byte-identical and the response `traceparent`
+  is the inbound value verbatim (T-17). With it set, each request is a
+  SERVER span parented on the inbound `traceparent`, each saved-query run
+  a CLIENT span, and the returned `traceparent` is `00-<trace id>-<Resql
+  request span id>-<flags>` under the caller's trace id, so a downstream
+  hop nests under Resql instead of beside it. `X-Trace-Id` is unchanged.
+- **Motivation.** PATTERNS.md §4: every Buerostack core component adopts
+  the inbound W3C trace, emits spans to a collector and echoes the trace.
+  The span id change is what makes the trace a tree rather than a flat
+  list of siblings.
+- **Migration.** None to opt out. A client that compared the response
+  `traceparent` byte-for-byte to the one it sent must stop doing so when
+  the operator enables export; the trace id is the stable part.
+- **Reversibility.** low: unset the variable. The code path is behind a
+  single runtime switch.
