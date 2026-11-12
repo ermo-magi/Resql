@@ -11,6 +11,7 @@
 //! a blocking gate (add `--strict`).
 
 use std::io::Write;
+use std::path::Path;
 use std::process::Command;
 
 fn resql_bin() -> &'static str {
@@ -82,6 +83,113 @@ fn doctor_exits_one_on_config_parse_failure() {
         out.status
     );
     assert!(stdout.contains("ERROR: config parse"));
+}
+
+/// `doctor` with a clean slate of OTel/Resql log variables plus `env`.
+fn doctor_with_env(cfg: &Path, strict: bool, env: &[(&str, &str)]) -> (Option<i32>, String) {
+    let mut cmd = Command::new(resql_bin());
+    cmd.arg("doctor");
+    if strict {
+        cmd.arg("--strict");
+    }
+    cmd.arg("-c").arg(cfg);
+    for (key, _) in std::env::vars() {
+        if key.starts_with("OTEL_") {
+            cmd.env_remove(key);
+        }
+    }
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+    let out = cmd.output().expect("spawn doctor");
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+    )
+}
+
+const LOOPBACK_CFG: &str = "sql_dir: ./sql\nserver:\n  bind: \"127.0.0.1:8080\"\n";
+
+#[test]
+fn doctor_says_nothing_about_otel_when_export_is_off() {
+    let cfg = write_config(LOOPBACK_CFG);
+    let (code, stdout) = doctor_with_env(cfg.path(), true, &[]);
+    assert_eq!(code, Some(0), "{stdout}");
+    assert!(!stdout.to_ascii_lowercase().contains("otel"), "{stdout}");
+}
+
+#[test]
+fn doctor_reports_a_clean_otel_export_without_warnings() {
+    let cfg = write_config(LOOPBACK_CFG);
+    let (code, stdout) = doctor_with_env(
+        cfg.path(),
+        true,
+        &[
+            (
+                "OTEL_EXPORTER_OTLP_ENDPOINT",
+                "http://collector.internal:4317",
+            ),
+            ("OTEL_SERVICE_NAME", "orders-resql"),
+        ],
+    );
+    assert_eq!(code, Some(0), "clean export must pass --strict: {stdout}");
+    assert!(
+        stdout.contains("INFO: [otel] OTLP trace export enabled: endpoint=http://collector.internal:4317 protocol=grpc service.name=orders-resql export_timeout_ms=10000"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("0 warning(s)"), "{stdout}");
+}
+
+#[test]
+fn doctor_warns_about_risky_otel_settings_and_strict_fails_on_them() {
+    let cfg = write_config(LOOPBACK_CFG);
+    let risky: [(&[(&str, &str)], &str); 4] = [
+        (
+            &[
+                ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://192.0.2.1:4318"),
+                ("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf"),
+                (
+                    "OTEL_EXPORTER_OTLP_HEADERS",
+                    "authorization=Bearer%20SECRETVALUE",
+                ),
+            ],
+            "plaintext",
+        ),
+        (
+            &[("OTEL_EXPORTER_OTLP_ENDPOINT", "https://collector:4317")],
+            "no TLS",
+        ),
+        (
+            &[(
+                "OTEL_EXPORTER_OTLP_ENDPOINT",
+                "http://user:HUNTER2@collector:4318",
+            )],
+            "must not carry credentials",
+        ),
+        (
+            &[
+                ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector:4318"),
+                ("OTEL_EXPORTER_OTLP_TIMEOUT", "ten"),
+            ],
+            "positive number of milliseconds",
+        ),
+    ];
+    for (env, needle) in risky {
+        let (code, stdout) = doctor_with_env(cfg.path(), true, env);
+        assert_eq!(code, Some(2), "{needle}: --strict must exit 2: {stdout}");
+        assert!(
+            stdout
+                .lines()
+                .any(|l| l.starts_with("WARN: [otel]") && l.contains(needle)),
+            "{needle}: {stdout}"
+        );
+        for secret in ["SECRETVALUE", "HUNTER2"] {
+            assert!(!stdout.contains(secret), "{secret} leaked: {stdout}");
+        }
+        // Without --strict the same configuration is informational only.
+        let (code, _) = doctor_with_env(cfg.path(), false, env);
+        assert_eq!(code, Some(0), "{needle}");
+    }
 }
 
 #[test]

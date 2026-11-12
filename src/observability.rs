@@ -19,9 +19,14 @@
 //! | `OTEL_EXPORTER_OTLP_ENDPOINT` | Enables export. gRPC: `http://host:4317`; HTTP: `http(s)://host:4318` |
 //! | `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL` / `OTEL_EXPORTER_OTLP_PROTOCOL` | `grpc` (default) or `http/protobuf` |
 //! | `OTEL_EXPORTER_OTLP_HEADERS` | Extra exporter headers, e.g. `authorization=Bearer%20<token>` |
-//! | `OTEL_EXPORTER_OTLP_TIMEOUT` | Export timeout in ms |
+//! | `OTEL_EXPORTER_OTLP_TRACES_TIMEOUT` / `OTEL_EXPORTER_OTLP_TIMEOUT` | Per-export timeout in ms, applied to both transports (default 10 000) |
 //! | `OTEL_SERVICE_NAME` | `service.name` (default `resql`) |
 //! | `OTEL_RESOURCE_ATTRIBUTES` | Extra resource attributes |
+//!
+//! Export is independent of the log filter: `RESQL_LOG` / `logging.level`
+//! decide what is logged, never what is exported (see [`build_dispatch`]).
+//! On SIGTERM the final flush is bounded by [`SHUTDOWN_DEADLINE`] (see
+//! [`shutdown`]).
 //!
 //! Reference: `book/src/logging.md` ("Trace export (OTLP)").
 
@@ -35,11 +40,23 @@ use opentelemetry_sdk::{
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
-use tracing_subscriber::Layer;
+use tracing_subscriber::fmt::MakeWriter;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::{EnvFilter, Layer, Registry};
 
 /// Default `service.name` when `OTEL_SERVICE_NAME` is unset.
 pub const SERVICE_NAME_DEFAULT: &str = "resql";
+
+/// Per-export timeout when neither `OTEL_EXPORTER_OTLP_TRACES_TIMEOUT` nor
+/// `OTEL_EXPORTER_OTLP_TIMEOUT` is set (the OTel specification default).
+pub const EXPORT_TIMEOUT_DEFAULT: Duration = Duration::from_secs(10);
+
+/// Upper bound on the final span flush at shutdown. Kept under the 10 s
+/// `docker stop` grace period so a hung collector cannot turn a clean
+/// SIGTERM into a SIGKILL.
+pub const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(5);
 
 /// Set once [`init_provider_from_env`] has wired an exporter. The request
 /// path reads it to decide whether to create or populate OTel-only spans
@@ -70,23 +87,86 @@ pub enum OtlpTransport {
     HttpProtobuf,
 }
 
-/// Resolve the OTLP transport from the standard env vars. The per-signal
-/// variable wins. Unknown values fall back to gRPC with a warning on stderr
-/// (the subscriber is not installed yet when this runs).
-pub fn otlp_transport_from_env() -> OtlpTransport {
-    let raw = std::env::var("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL")
-        .or_else(|_| std::env::var("OTEL_EXPORTER_OTLP_PROTOCOL"))
-        .unwrap_or_default();
-    match raw.trim() {
-        "" | "grpc" => OtlpTransport::Grpc,
-        "http/protobuf" => OtlpTransport::HttpProtobuf,
-        other => {
-            eprintln!(
-                "OTEL_EXPORTER_OTLP_PROTOCOL={other:?} is not supported (grpc, http/protobuf); using grpc"
-            );
-            OtlpTransport::Grpc
+impl OtlpTransport {
+    /// The `OTEL_EXPORTER_OTLP_PROTOCOL` spelling of this transport.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OtlpTransport::Grpc => "grpc",
+            OtlpTransport::HttpProtobuf => "http/protobuf",
         }
     }
+}
+
+/// Parse a protocol value. Unknown values fall back to gRPC and come back
+/// with a warning for the caller to log once the subscriber is installed.
+fn transport_from(raw: &str) -> (OtlpTransport, Option<String>) {
+    match raw.trim() {
+        "" | "grpc" => (OtlpTransport::Grpc, None),
+        "http/protobuf" => (OtlpTransport::HttpProtobuf, None),
+        other => (
+            OtlpTransport::Grpc,
+            Some(format!(
+                "OTEL_EXPORTER_OTLP_PROTOCOL={:?} is not supported (grpc, http/protobuf); using grpc",
+                other.chars().take(64).collect::<String>()
+            )),
+        ),
+    }
+}
+
+fn env_nonempty(key: &str) -> Option<String> {
+    std::env::var(key).ok().filter(|s| !s.trim().is_empty())
+}
+
+fn protocol_env() -> String {
+    env_nonempty("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL")
+        .or_else(|| env_nonempty("OTEL_EXPORTER_OTLP_PROTOCOL"))
+        .unwrap_or_default()
+}
+
+/// Resolve the OTLP transport from the standard env vars. The per-signal
+/// variable wins. Unknown values fall back to gRPC; [`export_status_from_env`]
+/// reports that as a warning.
+pub fn otlp_transport_from_env() -> OtlpTransport {
+    transport_from(&protocol_env()).0
+}
+
+/// Parse an export timeout in milliseconds. Unset or empty gives
+/// [`EXPORT_TIMEOUT_DEFAULT`]; anything that is not a positive integer
+/// also gives the default, with a warning naming the variable.
+pub fn export_timeout(var: &str, raw: Option<&str>) -> (Duration, Option<String>) {
+    let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return (EXPORT_TIMEOUT_DEFAULT, None);
+    };
+    match raw.parse::<u64>() {
+        Ok(ms) if ms > 0 => (Duration::from_millis(ms), None),
+        _ => (
+            EXPORT_TIMEOUT_DEFAULT,
+            Some(format!(
+                "{var}={:?} is not a positive number of milliseconds; using {} ms",
+                raw.chars().take(64).collect::<String>(),
+                EXPORT_TIMEOUT_DEFAULT.as_millis()
+            )),
+        ),
+    }
+}
+
+/// The timeout variable in effect (per-signal wins) and its raw value.
+fn timeout_env() -> (&'static str, Option<String>) {
+    for var in [
+        "OTEL_EXPORTER_OTLP_TRACES_TIMEOUT",
+        "OTEL_EXPORTER_OTLP_TIMEOUT",
+    ] {
+        if let Some(v) = env_nonempty(var) {
+            return (var, Some(v));
+        }
+    }
+    ("OTEL_EXPORTER_OTLP_TIMEOUT", None)
+}
+
+/// Per-export timeout from the environment.
+pub fn export_timeout_from_env() -> Duration {
+    let (var, raw) = timeout_env();
+    export_timeout(var, raw.as_deref()).0
 }
 
 /// Resource for exported spans: the SDK defaults (which include
@@ -99,61 +179,93 @@ pub fn otel_resource(service_name: &str) -> Resource {
     ]))
 }
 
-/// Build the OTLP span exporter for `endpoint` with the transport from
-/// [`otlp_transport_from_env`].
+/// Build the OTLP span exporter for `endpoint` with the transport and
+/// timeout from the environment ([`otlp_transport_from_env`],
+/// [`export_timeout_from_env`]). See [`build_span_exporter_with`].
+pub fn build_span_exporter(endpoint: &str) -> Result<opentelemetry_otlp::SpanExporter, String> {
+    build_span_exporter_with(
+        endpoint,
+        otlp_transport_from_env(),
+        export_timeout_from_env(),
+    )
+}
+
+/// Build the OTLP span exporter for `endpoint`.
+///
+/// `timeout` bounds every export request on both transports. The OTLP/HTTP
+/// exporter in `opentelemetry-otlp` 0.27 keeps its configured timeout but
+/// never applies it, so it is set on the `reqwest` client here; without
+/// that a hung collector holds each export until the batch processor's own
+/// 30 s cap.
 ///
 /// TLS is provided by OTLP/HTTP through `reqwest` + rustls; the gRPC
-/// exporter is plaintext. An `https://` endpoint with gRPC therefore warns
-/// once and is expected to fail on export.
-pub fn build_span_exporter(endpoint: &str) -> Result<opentelemetry_otlp::SpanExporter, String> {
-    // Endpoint, OTEL_EXPORTER_OTLP_HEADERS and OTEL_EXPORTER_OTLP_TIMEOUT are
-    // read by opentelemetry-otlp itself; header values are never logged here.
-    match otlp_transport_from_env() {
-        OtlpTransport::Grpc => {
-            if endpoint.starts_with("https://") {
-                eprintln!(
-                    "OTEL_EXPORTER_OTLP_ENDPOINT is https:// but the gRPC exporter has no TLS; \
-                     set OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf for a TLS endpoint"
-                );
-            }
+/// exporter is plaintext (see [`ExportStatus::warnings`] for the https +
+/// gRPC case). The endpoint and `OTEL_EXPORTER_OTLP_HEADERS` are read by
+/// `opentelemetry-otlp`; header values are never logged here.
+pub fn build_span_exporter_with(
+    endpoint: &str,
+    transport: OtlpTransport,
+    timeout: Duration,
+) -> Result<opentelemetry_otlp::SpanExporter, String> {
+    match transport {
+        OtlpTransport::Grpc => opentelemetry_otlp::SpanExporter::builder()
+            .with_tonic()
+            .with_endpoint(endpoint)
+            .with_timeout(timeout)
+            .build()
+            .map_err(|e| e.to_string()),
+        OtlpTransport::HttpProtobuf => {
+            let client = reqwest::Client::builder()
+                .timeout(timeout)
+                .build()
+                .map_err(|e| e.to_string())?;
             opentelemetry_otlp::SpanExporter::builder()
-                .with_tonic()
+                .with_http()
+                .with_protocol(opentelemetry_otlp::Protocol::HttpBinary)
                 .with_endpoint(endpoint)
+                .with_timeout(timeout)
+                .with_http_client(client)
                 .build()
                 .map_err(|e| e.to_string())
         }
-        OtlpTransport::HttpProtobuf => opentelemetry_otlp::SpanExporter::builder()
-            .with_http()
-            .with_protocol(opentelemetry_otlp::Protocol::HttpBinary)
-            .with_endpoint(endpoint)
-            .with_http_client(reqwest::Client::new())
-            .build()
-            .map_err(|e| e.to_string()),
     }
 }
 
+/// Why `endpoint` must not be used as given: it carries credentials. The
+/// exporter's error text (surfaced through `internal-logs`) echoes the
+/// endpoint URL verbatim, so credentials in it would reach the logs.
+/// Fails closed: any `@`, `?` or `#` after the scheme counts, because the
+/// userinfo of a URL whose password holds an unencoded delimiter cannot be
+/// told apart from a path or query.
+pub fn endpoint_credentials_problem(endpoint: &str) -> Option<&'static str> {
+    let rest = endpoint.trim().split_once("://")?.1;
+    rest.contains(['@', '?', '#']).then_some(
+        "OTEL_EXPORTER_OTLP_ENDPOINT must not carry credentials (user:password@host, ?query or #fragment); \
+         send secrets with OTEL_EXPORTER_OTLP_HEADERS",
+    )
+}
+
 /// Build the tracer provider when `OTEL_EXPORTER_OTLP_ENDPOINT` is set and
-/// non-empty. Returns `None` (export off) when it is unset or the exporter
-/// cannot be built; the latter warns once on stderr and the service keeps
-/// running with local logging only. Must run inside a Tokio runtime.
-pub fn init_provider_from_env() -> Option<TracerProvider> {
-    let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
-        .ok()
-        .filter(|s| !s.trim().is_empty())?;
-    let exporter = match build_span_exporter(&endpoint) {
-        Ok(e) => e,
-        Err(err) => {
-            eprintln!("OTel exporter init failed ({err}); falling back to local logging only");
-            return None;
-        }
+/// non-empty. `Ok(None)` means export is off (variable unset or empty).
+/// `Err` means the exporter could not be built (or the endpoint was
+/// refused, see [`endpoint_credentials_problem`]): the service keeps
+/// running with local logging only, and the caller logs the reason once
+/// the subscriber is installed. Must run inside a Tokio runtime.
+pub fn init_provider_from_env() -> Result<Option<TracerProvider>, String> {
+    let Some(endpoint) = env_nonempty("OTEL_EXPORTER_OTLP_ENDPOINT") else {
+        return Ok(None);
     };
+    if let Some(problem) = endpoint_credentials_problem(&endpoint) {
+        return Err(problem.to_string());
+    }
+    let exporter = build_span_exporter(&endpoint)?;
     opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
     let provider = TracerProvider::builder()
         .with_batch_exporter(exporter, Tokio)
         .with_resource(otel_resource(&service_name()))
         .build();
     OTEL_ACTIVE.store(true, Ordering::Relaxed);
-    Some(provider)
+    Ok(Some(provider))
 }
 
 /// `OTEL_SERVICE_NAME`, or [`SERVICE_NAME_DEFAULT`].
@@ -186,10 +298,273 @@ where
         }))
 }
 
-/// Flush pending spans and stop the exporter.
-pub fn shutdown(provider: Option<TracerProvider>) {
-    if let Some(p) = provider {
-        let _ = p.shutdown();
+/// Build the global subscriber: one `fmt` layer for logs, plus the OTel
+/// layer when `provider` is set.
+///
+/// `filter` (from `RESQL_LOG` / `logging.level`) is attached to the log
+/// layer ONLY. It used to sit on the registry, where it also gated the OTel
+/// layer: with `RESQL_LOG=warn` the info-level request and query spans were
+/// disabled for everybody and nothing was exported, with no sign of it in
+/// the logs. The OTel layer applies its own filter ([`layer`]); what is
+/// logged and what is exported are now independent.
+///
+/// `format` is `"json"` for JSON lines, anything else for text. `writer` is
+/// where log lines go (`std::io::stdout` in the binary).
+pub fn build_dispatch<W>(
+    filter: EnvFilter,
+    format: &str,
+    writer: W,
+    provider: Option<&TracerProvider>,
+) -> tracing::Dispatch
+where
+    W: for<'w> MakeWriter<'w> + Send + Sync + 'static,
+{
+    let log_layer: Box<dyn Layer<Registry> + Send + Sync> = match format {
+        "json" => tracing_subscriber::fmt::layer()
+            .json()
+            .with_current_span(true)
+            .with_span_list(false)
+            .with_writer(writer)
+            .with_filter(filter)
+            .boxed(),
+        _ => tracing_subscriber::fmt::layer()
+            .with_writer(writer)
+            .with_filter(filter)
+            .boxed(),
+    };
+    tracing::Dispatch::new(
+        tracing_subscriber::registry()
+            .with(log_layer)
+            .with(provider.map(layer)),
+    )
+}
+
+/// Flush pending spans and stop the exporter, waiting at most
+/// [`SHUTDOWN_DEADLINE`]. Returns `true` when the flush finished in time.
+pub async fn shutdown(provider: Option<TracerProvider>) -> bool {
+    shutdown_within(provider, SHUTDOWN_DEADLINE).await
+}
+
+/// [`shutdown`] with an explicit deadline.
+///
+/// `TracerProvider::shutdown` blocks its caller until the batch exporter
+/// has finished, with no bound of its own beyond the batch processor's
+/// 30 s export cap. It runs on a dedicated OS thread (not
+/// `spawn_blocking`: dropping the runtime would wait for that task) and
+/// this future gives up after `deadline`, so a hung collector costs at most
+/// `deadline` and never blocks a runtime worker. Spans still queued at the
+/// deadline are lost; that is logged, with the exporter's reason (the
+/// endpoint cannot carry credentials, see [`endpoint_credentials_problem`],
+/// and header values are never part of exporter errors).
+pub async fn shutdown_within(provider: Option<TracerProvider>, deadline: Duration) -> bool {
+    let Some(provider) = provider else {
+        return true;
+    };
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    let spawned = std::thread::Builder::new()
+        .name("otel-shutdown".into())
+        .spawn(move || {
+            let _ = done_tx.send(provider.shutdown().map_err(|e| e.to_string()));
+        });
+    if spawned.is_err() {
+        tracing::warn!("could not start the OTLP flush thread; queued spans are lost");
+        return false;
+    }
+    match tokio::time::timeout(deadline, done_rx).await {
+        Ok(Ok(Ok(()))) => true,
+        Ok(Ok(Err(reason))) => {
+            tracing::warn!(
+                reason = %truncate_reason(&reason),
+                "OTLP span flush failed; queued spans may be lost (check collector reachability)"
+            );
+            false
+        }
+        Ok(Err(_)) => {
+            tracing::warn!(
+                "OTLP span flush thread ended without a result; queued spans may be lost"
+            );
+            false
+        }
+        Err(_) => {
+            tracing::warn!(
+                deadline_ms = deadline.as_millis() as u64,
+                "OTLP span flush did not finish before the shutdown deadline; queued spans are lost"
+            );
+            false
+        }
+    }
+}
+
+/// Exporter error text for a log field: one line, bounded.
+fn truncate_reason(reason: &str) -> String {
+    reason
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(300)
+        .collect()
+}
+
+/// `scheme://host[:port]` of an exporter endpoint, with userinfo, path,
+/// query and fragment removed so credentials never reach logs. `None` when
+/// the value is not `scheme://authority…`.
+///
+/// Fails closed: the host is whatever follows the LAST `@`, so a password
+/// holding an unencoded `/`, `?` or `#` cannot leak a prefix. The price is
+/// that an `@` in a path or query shows the wrong host; both are rare and
+/// a wrong display is better than a leak.
+pub fn redacted_endpoint(endpoint: &str) -> Option<String> {
+    let (scheme, rest) = endpoint.trim().split_once("://")?;
+    let after_userinfo = rest.rsplit_once('@').map_or(rest, |(_, tail)| tail);
+    let host_port = after_userinfo.split(['/', '?', '#']).next().unwrap_or("");
+    if scheme.is_empty() || host_port.is_empty() {
+        return None;
+    }
+    Some(format!("{}://{}", scheme.to_ascii_lowercase(), host_port))
+}
+
+/// Host part of `scheme://host[:port]` (brackets kept for IPv6).
+fn endpoint_host(redacted: &str) -> &str {
+    let host_port = redacted.split_once("://").map_or(redacted, |(_, h)| h);
+    if host_port.starts_with('[') {
+        host_port.split_inclusive(']').next().unwrap_or(host_port)
+    } else {
+        host_port.split(':').next().unwrap_or(host_port)
+    }
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    bare.eq_ignore_ascii_case("localhost")
+        || bare
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// What an operator needs to know about the export configuration, shared
+/// by the boot log and `resql doctor`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportStatus {
+    /// `scheme://host[:port]`; never userinfo, path or query.
+    pub endpoint: String,
+    pub transport: OtlpTransport,
+    pub service_name: String,
+    pub timeout: Duration,
+    /// Actionable problems with the configuration, one sentence each.
+    /// None of them contains header values or endpoint credentials.
+    pub warnings: Vec<String>,
+}
+
+/// Inputs of [`describe_export`], gathered from the environment by
+/// [`export_status_from_env`].
+pub struct ExportInputs<'a> {
+    pub endpoint: &'a str,
+    pub protocol: &'a str,
+    pub has_headers: bool,
+    pub timeout_var: &'a str,
+    pub timeout_raw: Option<&'a str>,
+    pub service_name: &'a str,
+}
+
+/// Pure description of an export configuration; see [`ExportStatus`].
+pub fn describe_export(input: &ExportInputs<'_>) -> ExportStatus {
+    let mut warnings = Vec::new();
+    let (transport, protocol_warning) = transport_from(input.protocol);
+    warnings.extend(protocol_warning);
+    let (timeout, timeout_warning) = export_timeout(input.timeout_var, input.timeout_raw);
+    warnings.extend(timeout_warning);
+
+    let endpoint = redacted_endpoint(input.endpoint).unwrap_or_else(|| {
+        warnings.push(
+            "OTEL_EXPORTER_OTLP_ENDPOINT is not a scheme://host[:port] URL; the exporter will not work"
+                .to_string(),
+        );
+        "<unparsable endpoint>".to_string()
+    });
+    let scheme = endpoint.split("://").next().unwrap_or("");
+    if let Some(problem) = endpoint_credentials_problem(input.endpoint) {
+        warnings.push(problem.to_string());
+    }
+    if scheme == "https" && transport == OtlpTransport::Grpc {
+        warnings.push(
+            "OTEL_EXPORTER_OTLP_ENDPOINT is https:// but the gRPC exporter has no TLS and every \
+             export will fail; set OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf for a TLS endpoint"
+                .to_string(),
+        );
+    }
+    if scheme == "http" && input.has_headers && !is_loopback_host(endpoint_host(&endpoint)) {
+        warnings.push(format!(
+            "OTEL_EXPORTER_OTLP_HEADERS are sent in plaintext to non-loopback collector {endpoint}; \
+             use an https:// endpoint with OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf, or a collector on loopback"
+        ));
+    }
+    ExportStatus {
+        endpoint,
+        transport,
+        service_name: input.service_name.to_string(),
+        timeout,
+        warnings,
+    }
+}
+
+/// [`describe_export`] for the process environment; `None` when export is
+/// off (`OTEL_EXPORTER_OTLP_ENDPOINT` unset or empty).
+pub fn export_status_from_env() -> Option<ExportStatus> {
+    let endpoint = env_nonempty("OTEL_EXPORTER_OTLP_ENDPOINT")?;
+    let (timeout_var, timeout_raw) = timeout_env();
+    let has_headers = env_nonempty("OTEL_EXPORTER_OTLP_TRACES_HEADERS").is_some()
+        || env_nonempty("OTEL_EXPORTER_OTLP_HEADERS").is_some();
+    Some(describe_export(&ExportInputs {
+        endpoint: &endpoint,
+        protocol: &protocol_env(),
+        has_headers,
+        timeout_var,
+        timeout_raw: timeout_raw.as_deref(),
+        service_name: &service_name(),
+    }))
+}
+
+/// `err` with every occurrence of the raw `endpoint` replaced by its
+/// redacted form, so an exporter build error cannot echo credentials.
+pub fn scrub_endpoint(err: &str, endpoint: &str) -> String {
+    let shown = redacted_endpoint(endpoint).unwrap_or_else(|| "<endpoint>".to_string());
+    let mut out = err.replace(endpoint.trim(), &shown);
+    // Also hide userinfo if the error printed it separately.
+    if let Some((_, rest)) = endpoint.trim().split_once("://") {
+        if let Some((userinfo, _)) = rest.rsplit_once('@').filter(|(u, _)| !u.is_empty()) {
+            out = out.replace(userinfo, "<redacted>");
+        }
+    }
+    out
+}
+
+/// Log the export configuration through `tracing`. Call after the
+/// subscriber is installed, with the result of [`init_provider_from_env`]
+/// (`enabled` is whether a provider was built, `init_error` its failure).
+pub fn log_export_status(enabled: bool, init_error: Option<&str>) {
+    let Some(status) = export_status_from_env() else {
+        return;
+    };
+    if let Some(err) = init_error {
+        let raw = env_nonempty("OTEL_EXPORTER_OTLP_ENDPOINT").unwrap_or_default();
+        tracing::warn!(
+            endpoint = %status.endpoint,
+            "OTLP trace export disabled: {}",
+            scrub_endpoint(err, &raw)
+        );
+    } else if enabled {
+        tracing::info!(
+            endpoint = %status.endpoint,
+            protocol = status.transport.as_str(),
+            service.name = %status.service_name,
+            export_timeout_ms = status.timeout.as_millis() as u64,
+            "OTLP trace export enabled"
+        );
+    }
+    for warning in &status.warnings {
+        // The init error already said it.
+        if init_error != Some(warning.as_str()) {
+            tracing::warn!("{warning}");
+        }
     }
 }
 
@@ -346,6 +721,256 @@ pub fn record_db_outcome(span: &tracing::Span, rows: Option<usize>, error_code: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const GRPC: OtlpTransport = OtlpTransport::Grpc;
+    const HTTP: OtlpTransport = OtlpTransport::HttpProtobuf;
+
+    fn inputs<'a>(endpoint: &'a str, protocol: &'a str, has_headers: bool) -> ExportInputs<'a> {
+        ExportInputs {
+            endpoint,
+            protocol,
+            has_headers,
+            timeout_var: "OTEL_EXPORTER_OTLP_TIMEOUT",
+            timeout_raw: None,
+            service_name: "resql",
+        }
+    }
+
+    #[test]
+    fn export_timeout_accepts_positive_milliseconds() {
+        let var = "OTEL_EXPORTER_OTLP_TIMEOUT";
+        assert_eq!(export_timeout(var, None), (EXPORT_TIMEOUT_DEFAULT, None));
+        assert_eq!(
+            export_timeout(var, Some("  ")),
+            (EXPORT_TIMEOUT_DEFAULT, None)
+        );
+        assert_eq!(
+            export_timeout(var, Some(" 250 ")),
+            (Duration::from_millis(250), None)
+        );
+        assert_eq!(
+            export_timeout(var, Some("1")),
+            (Duration::from_millis(1), None)
+        );
+    }
+
+    #[test]
+    fn export_timeout_rejects_everything_else_loudly() {
+        let var = "OTEL_EXPORTER_OTLP_TRACES_TIMEOUT";
+        // 0 would fail every export; negatives, fractions, units, words and
+        // u64 overflow are not "a positive number of milliseconds".
+        for bad in ["0", "-5", "1.5", "10s", "abc", "99999999999999999999"] {
+            let (d, warning) = export_timeout(var, Some(bad));
+            assert_eq!(d, EXPORT_TIMEOUT_DEFAULT, "{bad}");
+            let w = warning.unwrap_or_else(|| panic!("{bad}: no warning"));
+            assert!(w.contains(var) && w.contains(bad), "{bad}: {w}");
+        }
+        let long = "x".repeat(10_000);
+        let (_, w) = export_timeout(var, Some(&long));
+        assert!(w.unwrap().len() < 300, "warning must cap echoed input");
+    }
+
+    #[test]
+    fn transport_parsing_covers_known_unknown_and_hostile_values() {
+        assert_eq!(transport_from(""), (GRPC, None));
+        assert_eq!(transport_from(" grpc "), (GRPC, None));
+        assert_eq!(transport_from("http/protobuf"), (HTTP, None));
+        assert_eq!(transport_from(" http/protobuf\n"), (HTTP, None));
+        for bad in ["http/json", "HTTP/PROTOBUF", "grpc,http", "http"] {
+            let (t, w) = transport_from(bad);
+            assert_eq!(t, GRPC, "{bad}");
+            assert!(w.unwrap().contains("not supported"), "{bad}");
+        }
+        let (_, w) = transport_from(&"y".repeat(10_000));
+        assert!(w.unwrap().len() < 300);
+    }
+
+    #[test]
+    fn redacted_endpoint_keeps_only_scheme_host_port() {
+        for (raw, want) in [
+            ("http://collector:4317", "http://collector:4317"),
+            (
+                "HTTPS://Collector.Example:4318/v1/traces",
+                "https://Collector.Example:4318",
+            ),
+            (
+                "http://user:pw@127.0.0.1:4318/?k=v#f",
+                "http://127.0.0.1:4318",
+            ),
+            ("http://user@host", "http://host"),
+            ("http://[::1]:4317/x", "http://[::1]:4317"),
+            ("  http://host:1  ", "http://host:1"),
+            // Unencoded delimiters inside the password must not leak a prefix.
+            ("http://u:pa/ss@host:1", "http://host:1"),
+            ("http://u:pa?ss@host:1", "http://host:1"),
+            ("http://u:pa#ss@host:1", "http://host:1"),
+            ("http://u:p@ss@host:1", "http://host:1"),
+        ] {
+            assert_eq!(redacted_endpoint(raw).as_deref(), Some(want), "{raw}");
+        }
+        for bad in [
+            "",
+            "collector:4317",
+            "://host",
+            "http://",
+            "http://@",
+            "not a url",
+        ] {
+            assert_eq!(redacted_endpoint(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn loopback_detection_is_exact() {
+        for yes in [
+            "localhost",
+            "LOCALHOST",
+            "127.0.0.1",
+            "127.9.9.9",
+            "[::1]",
+            "::1",
+        ] {
+            assert!(is_loopback_host(yes), "{yes}");
+        }
+        for no in [
+            "collector",
+            "192.0.2.1",
+            "0.0.0.0",
+            "[2001:db8::1]",
+            "localhost.evil.example",
+            "127.0.0.1.evil.example",
+            "",
+        ] {
+            assert!(!is_loopback_host(no), "{no}");
+        }
+    }
+
+    #[test]
+    fn clean_configurations_have_no_warnings() {
+        for (endpoint, protocol, headers) in [
+            ("http://collector:4317", "", false),
+            ("http://collector:4318", "http/protobuf", false),
+            ("https://collector:4318", "http/protobuf", true),
+            ("http://127.0.0.1:4318", "http/protobuf", true),
+            ("http://localhost:4317", "grpc", true),
+            ("http://[::1]:4317", "grpc", true),
+        ] {
+            let s = describe_export(&inputs(endpoint, protocol, headers));
+            assert!(
+                s.warnings.is_empty(),
+                "{endpoint} {protocol}: {:?}",
+                s.warnings
+            );
+        }
+    }
+
+    #[test]
+    fn describe_export_warns_on_each_risky_shape() {
+        let https_grpc = describe_export(&inputs("https://c:4317", "grpc", false));
+        assert_eq!(https_grpc.warnings.len(), 1);
+        assert!(https_grpc.warnings[0].contains("gRPC"));
+        assert!(https_grpc.warnings[0].contains("http/protobuf"));
+
+        let plain = describe_export(&inputs("http://192.0.2.1:4318", "http/protobuf", true));
+        assert_eq!(plain.warnings.len(), 1);
+        assert!(plain.warnings[0].contains("plaintext"));
+        assert!(plain.warnings[0].contains("http://192.0.2.1:4318"));
+
+        let bad_url = describe_export(&inputs("collector:4317", "", false));
+        assert_eq!(bad_url.endpoint, "<unparsable endpoint>");
+        assert!(bad_url.warnings[0].contains("scheme://host"));
+
+        let bad_proto = describe_export(&inputs("http://c:4317", "carrier-pigeon", false));
+        assert_eq!(bad_proto.transport, GRPC);
+        assert!(bad_proto.warnings[0].contains("not supported"));
+
+        let mut timeout = inputs("http://c:4317", "", false);
+        timeout.timeout_var = "OTEL_EXPORTER_OTLP_TRACES_TIMEOUT";
+        timeout.timeout_raw = Some("soon");
+        let t = describe_export(&timeout);
+        assert_eq!(t.timeout, EXPORT_TIMEOUT_DEFAULT);
+        assert!(t.warnings[0].contains("OTEL_EXPORTER_OTLP_TRACES_TIMEOUT"));
+    }
+
+    #[test]
+    fn plaintext_header_warning_needs_both_headers_and_a_remote_host() {
+        let remote = "http://192.0.2.1:4318";
+        assert!(describe_export(&inputs(remote, "http/protobuf", false))
+            .warnings
+            .is_empty());
+        assert!(!describe_export(&inputs(remote, "grpc", true))
+            .warnings
+            .is_empty());
+        assert!(
+            describe_export(&inputs("https://192.0.2.1:4318", "http/protobuf", true))
+                .warnings
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn credentials_in_the_endpoint_are_refused_fail_closed() {
+        for bad in [
+            "http://user:pw@collector:4318",
+            "http://user@collector:4318",
+            "http://collector:4318/?token=abc",
+            "http://collector:4318/v1#frag",
+            // Unencoded delimiters in a password.
+            "http://u:pa/ss@collector:4318",
+            "http://u:pa?ss@collector:4318",
+        ] {
+            assert!(endpoint_credentials_problem(bad).is_some(), "{bad}");
+        }
+        for ok in [
+            "http://collector:4318",
+            "https://collector.example/otlp-prefix",
+            "http://[::1]:4317",
+            "collector:4317",
+            "",
+        ] {
+            assert_eq!(endpoint_credentials_problem(ok), None, "{ok:?}");
+        }
+        let status = describe_export(&inputs("http://u:pw@c:4318", "http/protobuf", false));
+        assert!(status
+            .warnings
+            .iter()
+            .any(|w| w.contains("must not carry credentials")));
+        assert!(!format!("{status:?}").contains("pw"));
+    }
+
+    #[test]
+    fn status_never_carries_credentials() {
+        let status = describe_export(&inputs(
+            "http://exporter:HUNTER2@192.0.2.1:4318/?k=QSECRET",
+            "http/protobuf",
+            true,
+        ));
+        let dump = format!("{status:?}");
+        for secret in ["HUNTER2", "QSECRET", "exporter:"] {
+            assert!(!dump.contains(secret), "{secret} in {dump}");
+        }
+        assert_eq!(status.endpoint, "http://192.0.2.1:4318");
+        assert_eq!(status.timeout, EXPORT_TIMEOUT_DEFAULT);
+    }
+
+    #[test]
+    fn scrub_endpoint_removes_the_raw_url_and_userinfo() {
+        let raw = "http://exporter:HUNTER2@host:4318/v1?k=QSECRET";
+        let err = format!("invalid uri {raw}; user exporter:HUNTER2 rejected");
+        let out = scrub_endpoint(&err, raw);
+        assert!(!out.contains("HUNTER2"), "{out}");
+        assert!(out.contains("http://host:4318"), "{out}");
+        // Empty userinfo must not make the replace loop insert markers
+        // between every character.
+        assert_eq!(scrub_endpoint("boom", "http://@host"), "boom");
+        assert_eq!(scrub_endpoint("boom", "garbage"), "boom");
+    }
+
+    #[test]
+    fn transports_spell_the_standard_values() {
+        assert_eq!(GRPC.as_str(), "grpc");
+        assert_eq!(HTTP.as_str(), "http/protobuf");
+    }
 
     #[test]
     fn leading_keyword_skips_comments_and_whitespace() {

@@ -29,7 +29,7 @@ serde_yaml_ng = "0.10"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "sqlite", "mysql", "json", "chrono", "uuid", "rust_decimal"] }
 thiserror = "2.0"
 time = { version = "0.3", default-features = false, features = ["formatting", "macros", "std"] }
-tokio = { version = "1.40", features = ["macros", "rt-multi-thread", "signal"] }
+tokio = { version = "1.40", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 tower = { version = "0.5", default-features = false, features = ["util"] }
 tower-http = { version = "0.6", default-features = false, features = ["cors", "limit", "timeout"] }
 tracing = "0.1"
@@ -37,9 +37,9 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["e
 # Optional OTLP trace export, enabled at runtime by OTEL_EXPORTER_OTLP_ENDPOINT.
 # tonic is built without TLS (keeps rustls-pemfile out of the tree); TLS
 # endpoints use OTLP/HTTP through reqwest + rustls.
-opentelemetry = { version = "0.27", default-features = false, features = ["trace"] }
-opentelemetry_sdk = { version = "0.27", default-features = false, features = ["trace", "rt-tokio"] }
-opentelemetry-otlp = { version = "0.27", default-features = false, features = ["trace", "grpc-tonic", "http-proto", "reqwest-client"] }
+opentelemetry = { version = "0.27", default-features = false, features = ["trace", "internal-logs"] }
+opentelemetry_sdk = { version = "0.27", default-features = false, features = ["trace", "rt-tokio", "internal-logs"] }
+opentelemetry-otlp = { version = "0.27", default-features = false, features = ["trace", "grpc-tonic", "http-proto", "reqwest-client", "internal-logs"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 tracing-opentelemetry = { version = "0.28", default-features = false }
 
